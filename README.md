@@ -1,7 +1,8 @@
 # Learning Rust - vCard QR Code Generator
 
 A full-stack Rust application that generates QR codes from vCard contact information with SQLite persistence.
-This is for learning purpose only.
+
+### This is for learning purpose only!
 
 ## Features
 
