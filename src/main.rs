@@ -1,5 +1,5 @@
 use axum::{
-    extract::Json,
+    extract::{Json, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -8,6 +8,7 @@ use axum::{
 use image::{ImageBuffer, Luma, DynamicImage, ImageFormat};
 use qrcode::QrCode;
 use serde::{Deserialize, Serialize};
+use sqlx::{SqlitePool, migrate::MigrateDatabase, Sqlite};
 use std::io::Cursor;
 use tower_http::services::ServeDir;
 
@@ -106,14 +107,44 @@ fn parse_color(color_str: &str) -> (u8, u8, u8) {
     }
 }
 
-async fn generate_qr(Json(data): Json<VCardData>) -> Result<Json<QrResponse>, StatusCode> {
+async fn generate_qr(
+    State(pool): State<SqlitePool>,
+    Json(data): Json<VCardData>,
+) -> Result<Json<QrResponse>, StatusCode> {
+    // Save to database
+    let result = sqlx::query(
+        r#"
+        INSERT INTO vcards (first_name, last_name, mobile, work, email, company, role, street, city, state, website, color)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#
+    )
+    .bind(&data.first_name)
+    .bind(&data.last_name)
+    .bind(&data.mobile)
+    .bind(&data.work)
+    .bind(&data.email)
+    .bind(&data.company)
+    .bind(&data.role)
+    .bind(&data.street)
+    .bind(&data.city)
+    .bind(&data.state)
+    .bind(&data.website)
+    .bind(&data.color)
+    .execute(&pool)
+    .await;
+
+    if let Err(e) = result {
+        eprintln!("Database error: {}", e);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     let vcard_content = generate_vcard(&data);
-    
+
     let code = QrCode::new(vcard_content.as_bytes())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     let qr_image = code.render::<Luma<u8>>().build();
-    
+
     // Convert to colored image if color is specified
     let dynamic_img = if let Some(color_str) = &data.color {
         let (r, g, b) = parse_color(color_str);
@@ -131,14 +162,14 @@ async fn generate_qr(Json(data): Json<VCardData>) -> Result<Json<QrResponse>, St
     } else {
         DynamicImage::ImageLuma8(qr_image)
     };
-    
+
     // Encode to PNG
     let mut buffer = Cursor::new(Vec::new());
     dynamic_img.write_to(&mut buffer, ImageFormat::Png)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     let base64_img = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, buffer.into_inner());
-    
+
     Ok(Json(QrResponse {
         image: format!("data:image/png;base64,{}", base64_img),
     }))
@@ -149,18 +180,89 @@ async fn serve_index() -> Response {
     (StatusCode::OK, [(header::CONTENT_TYPE, "text/html")], html).into_response()
 }
 
+async fn run_migrations(pool: &SqlitePool) -> Result<(), Box<dyn std::error::Error>> {
+    // Create migrations table if it doesn't exist
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS migrations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // List of migrations to apply
+    let migrations = vec![
+        ("001_create_vcards_table", include_str!("../migrations/001_create_vcards_table.sql")),
+    ];
+
+    for (name, sql) in migrations {
+        // Check if migration already applied
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM migrations WHERE name = ?")
+            .bind(name)
+            .fetch_one(pool)
+            .await?;
+
+        if exists == 0 {
+            println!("Running migration: {}", name);
+
+            // Execute migration SQL
+            sqlx::raw_sql(sql).execute(pool).await?;
+
+            // Record migration as applied
+            sqlx::query("INSERT INTO migrations (name) VALUES (?)")
+                .bind(name)
+                .execute(pool)
+                .await?;
+
+            println!("✓ Migration {} applied", name);
+        } else {
+            println!("→ Migration {} already applied", name);
+        }
+    }
+
+    Ok(())
+}
+
+async fn init_database() -> Result<SqlitePool, Box<dyn std::error::Error>> {
+    let db_url = "sqlite://vcards.db";
+
+    // Create database if it doesn't exist
+    if !Sqlite::database_exists(db_url).await.unwrap_or(false) {
+        println!("Creating database...");
+        Sqlite::create_database(db_url).await?;
+        println!("✓ Database created");
+    }
+
+    // Connect to database
+    let pool = SqlitePool::connect(db_url).await?;
+    println!("✓ Connected to database");
+
+    // Run migrations
+    run_migrations(&pool).await?;
+
+    Ok(pool)
+}
+
 #[tokio::main]
 async fn main() {
+    // Initialize database
+    let pool = init_database().await.expect("Failed to initialize database");
+
     let app = Router::new()
         .route("/", get(serve_index))
         .route("/api/generate", post(generate_qr))
-        .nest_service("/static", ServeDir::new("static"));
+        .nest_service("/static", ServeDir::new("static"))
+        .with_state(pool);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
         .unwrap();
-    
+
     println!("Server running on http://127.0.0.1:3000");
-    
+
     axum::serve(listener, app).await.unwrap();
 }
