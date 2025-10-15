@@ -1,7 +1,3 @@
-use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Redirect, Response},
-};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tower_sessions::Session;
@@ -49,23 +45,6 @@ pub async fn get_current_user(session: &Session) -> Option<UserInfo> {
             is_admin,
         }),
         _ => None,
-    }
-}
-
-// Require authentication
-pub async fn require_auth(session: Session) -> Result<UserInfo, Response> {
-    match get_current_user(&session).await {
-        Some(user) => Ok(user),
-        None => Err(Redirect::to("/login").into_response()),
-    }
-}
-
-// Require admin
-pub async fn require_admin(session: Session) -> Result<UserInfo, Response> {
-    match get_current_user(&session).await {
-        Some(user) if user.is_admin => Ok(user),
-        Some(_) => Err((StatusCode::FORBIDDEN, "Admin access required").into_response()),
-        None => Err(Redirect::to("/login").into_response()),
     }
 }
 
