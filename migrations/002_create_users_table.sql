@@ -14,4 +14,4 @@ CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 -- Insert default admin user (password: admin)
 -- bcrypt hash of "admin" with cost 12
 INSERT OR IGNORE INTO users (username, password_hash, is_admin)
-VALUES ('admin', '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewY5GyYKqXqKKQWK', 1);
+VALUES ('admin', '$2b$12$21yrV/a7WOeMgVekvZMgB.VaT/2HyYU3OBnfFpyFDaHH3ewoIlHKi', 1);
