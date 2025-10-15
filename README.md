@@ -13,6 +13,8 @@ A full-stack Rust application that generates QR codes from vCard contact informa
 - ✅ SQLite database persistence with automatic migrations
 - ✅ All submissions stored with timestamps for record keeping
 
+![demo](./static/demo-qr-gen.png)
+
 ## Tech Stack
 
 - **Backend**: Axum (async Rust web framework)
