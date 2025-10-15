@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  vcard-qr-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vcard-qr-generator:latest
+    container_name: vcard-qr-generator
+    ports:
+      - "3000:3000"
+    volumes:
+      # Persist database outside container
+      - vcard-data:/app/data
+    environment:
+      - RUST_LOG=info
+      - DATABASE_PATH=/app/data/vcards.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/login"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    networks:
+      - vcard-network
+
+  # Optional: Nginx reverse proxy for SSL/HTTPS
+  # Uncomment if you want to use nginx for SSL termination
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: vcard-nginx
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  #     - ./ssl:/etc/nginx/ssl:ro
+  #   depends_on:
+  #     - vcard-qr-generator
+  #   restart: unless-stopped
+  #   networks:
+  #     - vcard-network
+
+volumes:
+  vcard-data:
+    driver: local
+
+networks:
+  vcard-network:
+    driver: bridge

@@ -511,18 +511,20 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), Box<dyn std::error::Err
 }
 
 async fn init_database() -> Result<SqlitePool, Box<dyn std::error::Error>> {
-    let db_url = "sqlite://vcards.db";
+    // Get database path from environment variable or use default
+    let db_path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "vcards.db".to_string());
+    let db_url = format!("sqlite://{}", db_path);
 
     // Create database if it doesn't exist
-    if !Sqlite::database_exists(db_url).await.unwrap_or(false) {
-        println!("Creating database...");
-        Sqlite::create_database(db_url).await?;
+    if !Sqlite::database_exists(&db_url).await.unwrap_or(false) {
+        println!("Creating database at {}...", db_path);
+        Sqlite::create_database(&db_url).await?;
         println!("✓ Database created");
     }
 
     // Connect to database
-    let pool = SqlitePool::connect(db_url).await?;
-    println!("✓ Connected to database");
+    let pool = SqlitePool::connect(&db_url).await?;
+    println!("✓ Connected to database at {}", db_path);
 
     // Run migrations
     run_migrations(&pool).await?;
@@ -539,8 +541,14 @@ async fn main() {
     let session_store = SqliteStore::new(pool.clone());
     session_store.migrate().await.expect("Failed to migrate session store");
 
+    // Get session expiry from environment variable (default 24 hours)
+    let session_hours = std::env::var("SESSION_EXPIRY_HOURS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(24);
+
     let session_layer = SessionManagerLayer::new(session_store)
-        .with_expiry(Expiry::OnInactivity(tower_sessions::cookie::time::Duration::hours(24))); // 24 hours
+        .with_expiry(Expiry::OnInactivity(tower_sessions::cookie::time::Duration::hours(session_hours)));
 
     let app = Router::new()
         // Public routes
@@ -562,12 +570,21 @@ async fn main() {
         .layer(session_layer)
         .with_state(pool);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+    // Get bind address from environment variable or use default
+    let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(3000);
+    let bind_addr = format!("{}:{}", host, port);
+
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .unwrap();
 
-    println!("Server running on http://127.0.0.1:3000");
+    println!("Server running on http://{}", bind_addr);
     println!("Default admin credentials: username=admin, password=admin");
+    println!("Database path: {}", std::env::var("DATABASE_PATH").unwrap_or_else(|_| "vcards.db".to_string()));
 
     axum::serve(listener, app).await.unwrap();
 }
