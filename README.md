@@ -1,4 +1,4 @@
-# vCard QR Code Generator - Rust Clone
+# vCard QR Code Generator - in Rust
 
 A full-stack Rust application that generates QR codes from vCard contact information with SQLite persistence.
 This is for learning purpose only.
