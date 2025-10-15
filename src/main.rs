@@ -1,8 +1,10 @@
+mod auth;
+
 use axum::{
-    extract::{Json, State},
+    extract::{Json, Path, State},
     http::{StatusCode, header},
-    response::{IntoResponse, Response},
-    routing::{get, post},
+    response::{IntoResponse, Redirect, Response},
+    routing::{get, post, put},
     Router,
 };
 use image::{ImageBuffer, Luma, DynamicImage, ImageFormat};
@@ -11,6 +13,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::{SqlitePool, migrate::MigrateDatabase, Sqlite};
 use std::io::Cursor;
 use tower_http::services::ServeDir;
+use tower_sessions::{Expiry, SessionManagerLayer};
+use tower_sessions_sqlx_store::SqliteStore;
+use tower_sessions::Session;
+
+use auth::{User, UserInfo, authenticate_user, set_user_session, clear_session, get_current_user, hash_password};
 
 #[derive(Deserialize)]
 struct VCardData {
@@ -33,13 +40,49 @@ struct QrResponse {
     image: String, // base64 encoded
 }
 
+#[derive(Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+#[derive(Deserialize)]
+struct CreateUserRequest {
+    username: String,
+    password: String,
+    is_admin: bool,
+}
+
+#[derive(Deserialize)]
+struct UpdateUserRequest {
+    username: String,
+    password: Option<String>,
+    is_admin: bool,
+}
+
+#[derive(Serialize)]
+struct MessageResponse {
+    message: String,
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
 fn generate_vcard(data: &VCardData) -> String {
     let mut vcard = String::from("BEGIN:VCARD\nVERSION:3.0\n");
-    
+
     // Name
     vcard.push_str(&format!("FN:{} {}\n", data.first_name, data.last_name));
     vcard.push_str(&format!("N:{};{};;;\n", data.last_name, data.first_name));
-    
+
     // Phone numbers
     if let Some(mobile) = &data.mobile {
         if !mobile.is_empty() {
@@ -51,14 +94,14 @@ fn generate_vcard(data: &VCardData) -> String {
             vcard.push_str(&format!("TEL;TYPE=WORK:{}\n", work));
         }
     }
-    
+
     // Email
     if let Some(email) = &data.email {
         if !email.is_empty() {
             vcard.push_str(&format!("EMAIL:{}\n", email));
         }
     }
-    
+
     // Organization
     if let Some(company) = &data.company {
         if !company.is_empty() {
@@ -70,7 +113,7 @@ fn generate_vcard(data: &VCardData) -> String {
             vcard.push_str(&format!("TITLE:{}\n", role));
         }
     }
-    
+
     // Address
     let has_address = data.street.as_ref().map_or(false, |s| !s.is_empty())
         || data.city.as_ref().map_or(false, |s| !s.is_empty())
@@ -83,14 +126,14 @@ fn generate_vcard(data: &VCardData) -> String {
             data.state.as_ref().unwrap_or(&String::new())
         ));
     }
-    
+
     // Website
     if let Some(website) = &data.website {
         if !website.is_empty() {
             vcard.push_str(&format!("URL:{}\n", website));
         }
     }
-    
+
     vcard.push_str("END:VCARD");
     vcard
 }
@@ -107,10 +150,221 @@ fn parse_color(color_str: &str) -> (u8, u8, u8) {
     }
 }
 
+// Authentication handlers
+async fn login_handler(
+    State(pool): State<SqlitePool>,
+    session: Session,
+    Json(req): Json<LoginRequest>,
+) -> Result<Json<MessageResponse>, (StatusCode, Json<ErrorResponse>)> {
+    match authenticate_user(&pool, &req.username, &req.password).await {
+        Ok(user) => {
+            set_user_session(&session, &user).await
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Session error".to_string() })))?;
+
+            Ok(Json(MessageResponse {
+                message: "Login successful".to_string(),
+            }))
+        }
+        Err(e) => Err((StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: e }))),
+    }
+}
+
+async fn logout_handler(session: Session) -> impl IntoResponse {
+    clear_session(&session).await;
+    Json(MessageResponse {
+        message: "Logged out".to_string(),
+    })
+}
+
+async fn me_handler(session: Session) -> Result<Json<UserInfo>, StatusCode> {
+    match get_current_user(&session).await {
+        Some(user) => Ok(Json(user)),
+        None => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+async fn change_password_handler(
+    State(pool): State<SqlitePool>,
+    session: Session,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<Json<MessageResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user_info = get_current_user(&session).await
+        .ok_or((StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "Not authenticated".to_string() })))?;
+
+    // Get full user from database
+    let user: User = sqlx::query_as("SELECT id, username, password_hash, is_admin FROM users WHERE id = ?")
+        .bind(user_info.id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Database error".to_string() })))?;
+
+    // Verify current password
+    if !auth::verify_password(&req.current_password, &user.password_hash) {
+        return Err((StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "Current password is incorrect".to_string() })));
+    }
+
+    // Hash new password
+    let new_hash = hash_password(&req.new_password)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Failed to hash password".to_string() })))?;
+
+    // Update password
+    sqlx::query("UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .bind(&new_hash)
+        .bind(user.id)
+        .execute(&pool)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Failed to update password".to_string() })))?;
+
+    Ok(Json(MessageResponse {
+        message: "Password updated successfully".to_string(),
+    }))
+}
+
+// Admin handlers
+async fn get_users_handler(
+    State(pool): State<SqlitePool>,
+    session: Session,
+) -> Result<Json<Vec<UserInfo>>, (StatusCode, Json<ErrorResponse>)> {
+    let user = get_current_user(&session).await
+        .ok_or((StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "Not authenticated".to_string() })))?;
+
+    if !user.is_admin {
+        return Err((StatusCode::FORBIDDEN, Json(ErrorResponse { error: "Admin access required".to_string() })));
+    }
+
+    // Fetch users with created_at for display
+
+    #[derive(Serialize, sqlx::FromRow)]
+    struct UserWithDate {
+        id: i64,
+        username: String,
+        is_admin: bool,
+        created_at: String,
+    }
+
+    let users_with_dates: Vec<UserWithDate> = sqlx::query_as("SELECT id, username, is_admin, created_at FROM users ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Database error".to_string() })))?;
+
+    Ok(Json(users_with_dates.into_iter().map(|u| UserInfo { id: u.id, username: u.username, is_admin: u.is_admin }).collect()))
+}
+
+async fn create_user_handler(
+    State(pool): State<SqlitePool>,
+    session: Session,
+    Json(req): Json<CreateUserRequest>,
+) -> Result<Json<MessageResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = get_current_user(&session).await
+        .ok_or((StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "Not authenticated".to_string() })))?;
+
+    if !user.is_admin {
+        return Err((StatusCode::FORBIDDEN, Json(ErrorResponse { error: "Admin access required".to_string() })));
+    }
+
+    let password_hash = hash_password(&req.password)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Failed to hash password".to_string() })))?;
+
+    sqlx::query("INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, ?)")
+        .bind(&req.username)
+        .bind(&password_hash)
+        .bind(req.is_admin)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("UNIQUE") {
+                (StatusCode::CONFLICT, Json(ErrorResponse { error: "Username already exists".to_string() }))
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Database error".to_string() }))
+            }
+        })?;
+
+    Ok(Json(MessageResponse {
+        message: "User created successfully".to_string(),
+    }))
+}
+
+async fn update_user_handler(
+    State(pool): State<SqlitePool>,
+    session: Session,
+    Path(user_id): Path<i64>,
+    Json(req): Json<UpdateUserRequest>,
+) -> Result<Json<MessageResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = get_current_user(&session).await
+        .ok_or((StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "Not authenticated".to_string() })))?;
+
+    if !user.is_admin {
+        return Err((StatusCode::FORBIDDEN, Json(ErrorResponse { error: "Admin access required".to_string() })));
+    }
+
+    // Update username and admin status
+    sqlx::query("UPDATE users SET username = ?, is_admin = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .bind(&req.username)
+        .bind(req.is_admin)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Failed to update user".to_string() })))?;
+
+    // Update password if provided
+    if let Some(password) = req.password {
+        if !password.is_empty() {
+            let password_hash = hash_password(&password)
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Failed to hash password".to_string() })))?;
+
+            sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+                .bind(&password_hash)
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Failed to update password".to_string() })))?;
+        }
+    }
+
+    Ok(Json(MessageResponse {
+        message: "User updated successfully".to_string(),
+    }))
+}
+
+async fn delete_user_handler(
+    State(pool): State<SqlitePool>,
+    session: Session,
+    Path(user_id): Path<i64>,
+) -> Result<Json<MessageResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = get_current_user(&session).await
+        .ok_or((StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "Not authenticated".to_string() })))?;
+
+    if !user.is_admin {
+        return Err((StatusCode::FORBIDDEN, Json(ErrorResponse { error: "Admin access required".to_string() })));
+    }
+
+    // Prevent deleting own account
+    if user.id == user_id {
+        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: "Cannot delete your own account".to_string() })));
+    }
+
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Failed to delete user".to_string() })))?;
+
+    Ok(Json(MessageResponse {
+        message: "User deleted successfully".to_string(),
+    }))
+}
+
+// VCard generation handler (requires auth)
 async fn generate_qr(
     State(pool): State<SqlitePool>,
+    session: Session,
     Json(data): Json<VCardData>,
 ) -> Result<Json<QrResponse>, StatusCode> {
+    // Check authentication
+    if get_current_user(&session).await.is_none() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
     // Save to database
     let result = sqlx::query(
         r#"
@@ -175,9 +429,37 @@ async fn generate_qr(
     }))
 }
 
-async fn serve_index() -> Response {
+// Page handlers
+async fn serve_index(session: Session) -> Response {
+    if get_current_user(&session).await.is_none() {
+        return Redirect::to("/login").into_response();
+    }
     let html = include_str!("../static/index.html");
     (StatusCode::OK, [(header::CONTENT_TYPE, "text/html")], html).into_response()
+}
+
+async fn serve_login() -> Response {
+    let html = include_str!("../static/login.html");
+    (StatusCode::OK, [(header::CONTENT_TYPE, "text/html")], html).into_response()
+}
+
+async fn serve_profile(session: Session) -> Response {
+    if get_current_user(&session).await.is_none() {
+        return Redirect::to("/login").into_response();
+    }
+    let html = include_str!("../static/profile.html");
+    (StatusCode::OK, [(header::CONTENT_TYPE, "text/html")], html).into_response()
+}
+
+async fn serve_admin(session: Session) -> Response {
+    match get_current_user(&session).await {
+        Some(user) if user.is_admin => {
+            let html = include_str!("../static/admin.html");
+            (StatusCode::OK, [(header::CONTENT_TYPE, "text/html")], html).into_response()
+        }
+        Some(_) => (StatusCode::FORBIDDEN, "Admin access required").into_response(),
+        None => Redirect::to("/login").into_response(),
+    }
 }
 
 async fn run_migrations(pool: &SqlitePool) -> Result<(), Box<dyn std::error::Error>> {
@@ -197,6 +479,7 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), Box<dyn std::error::Err
     // List of migrations to apply
     let migrations = vec![
         ("001_create_vcards_table", include_str!("../migrations/001_create_vcards_table.sql")),
+        ("002_create_users_table", include_str!("../migrations/002_create_users_table.sql")),
     ];
 
     for (name, sql) in migrations {
@@ -252,10 +535,31 @@ async fn main() {
     // Initialize database
     let pool = init_database().await.expect("Failed to initialize database");
 
+    // Create session store
+    let session_store = SqliteStore::new(pool.clone());
+    session_store.migrate().await.expect("Failed to migrate session store");
+
+    let session_layer = SessionManagerLayer::new(session_store)
+        .with_expiry(Expiry::OnInactivity(tower_sessions::cookie::time::Duration::hours(24))); // 24 hours
+
     let app = Router::new()
+        // Public routes
+        .route("/login", get(serve_login))
+        // Protected routes
         .route("/", get(serve_index))
+        .route("/profile", get(serve_profile))
+        .route("/admin", get(serve_admin))
+        // API routes
+        .route("/api/login", post(login_handler))
+        .route("/api/logout", post(logout_handler))
+        .route("/api/me", get(me_handler))
+        .route("/api/change-password", post(change_password_handler))
         .route("/api/generate", post(generate_qr))
+        // Admin API routes
+        .route("/api/users", get(get_users_handler).post(create_user_handler))
+        .route("/api/users/:id", put(update_user_handler).delete(delete_user_handler))
         .nest_service("/static", ServeDir::new("static"))
+        .layer(session_layer)
         .with_state(pool);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
@@ -263,6 +567,7 @@ async fn main() {
         .unwrap();
 
     println!("Server running on http://127.0.0.1:3000");
+    println!("Default admin credentials: username=admin, password=admin");
 
     axum::serve(listener, app).await.unwrap();
 }
